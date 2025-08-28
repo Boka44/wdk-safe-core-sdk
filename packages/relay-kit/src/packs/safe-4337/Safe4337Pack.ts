@@ -6,7 +6,8 @@ import Safe, {
   getMultiSendContract,
   PasskeyClient,
   SafeProvider,
-  generateOnChainIdentifier
+  generateOnChainIdentifier,
+  SafeAccountConfig
 } from '@safe-global/protocol-kit'
 import { RelayKitBasePack } from '@safe-global/relay-kit/RelayKitBasePack'
 import {
@@ -21,7 +22,11 @@ import {
   getSafe4337ModuleDeployment,
   getSafeWebAuthnShareSignerDeployment
 } from '@safe-global/safe-modules-deployments'
-import { Hash, encodeFunctionData, zeroAddress, Hex, concat } from 'viem'
+import {
+  getSafeSingletonDeployment,
+  getProxyFactoryDeployment
+} from '@safe-global/safe-deployments'
+import { Hash, encodeFunctionData, zeroAddress, Hex, concat, keccak256, slice } from 'viem'
 import BaseSafeOperation from '@safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
 import SafeOperationFactory from '@safe-global/relay-kit/packs/safe-4337/SafeOperationFactory'
 import {
@@ -50,11 +55,227 @@ import {
   createUserOperation
 } from '@safe-global/relay-kit/packs/safe-4337/utils'
 import { PimlicoFeeEstimator } from '@safe-global/relay-kit/packs/safe-4337/estimators/pimlico/PimlicoFeeEstimator'
+import { SafeVersion } from '@safe-global/types-kit'
+
+/**
+ * Gets the Safe contract addresses for a given chain ID and Safe version.
+ * Uses the @safe-global/safe-deployments package to dynamically fetch addresses.
+ *
+ * @param {bigint | number} chainId - The chain ID.
+ * @param {string} [safeVersion='1.4.1'] - The Safe version to resolve addresses for.
+ * @returns {{ factory: string; singleton: string }} Object containing factory and singleton addresses.
+ * @throws {Error} If no addresses are found for the chain ID and version.
+ */
+function getSafeContractAddresses(
+  chainId: bigint | number,
+  safeVersion: string = '1.4.1'
+): { factory: string; singleton: string } {
+  const chainIdStr = chainId.toString()
+
+  const singletonDeployment = getSafeSingletonDeployment({
+    version: safeVersion as SafeVersion,
+    released: true
+  })
+
+  if (!singletonDeployment) {
+    throw new Error(`No Safe singleton deployment found for version ${safeVersion}`)
+  }
+
+  // Get factory deployment for the specified version
+  const factoryDeployment = getProxyFactoryDeployment({
+    version: safeVersion as SafeVersion,
+    released: true
+  })
+
+  if (!factoryDeployment) {
+    throw new Error(`No Safe proxy factory deployment found for version ${safeVersion}`)
+  }
+
+  const singletonAddress = singletonDeployment.networkAddresses[chainIdStr]
+  const factoryAddress = factoryDeployment.networkAddresses[chainIdStr]
+
+  if (!singletonAddress) {
+    throw new Error(
+      `No Safe singleton address found for chain ID ${chainId} and version ${safeVersion}`
+    )
+  }
+
+  if (!factoryAddress) {
+    throw new Error(
+      `No Safe proxy factory address found for chain ID ${chainId} and version ${safeVersion}`
+    )
+  }
+
+  return {
+    factory: factoryAddress,
+    singleton: singletonAddress
+  }
+}
+
+// Proxy creation codes for different Safe versions
+const SAFE_PROXY_CREATION_CODES = {
+  // Early versions (1.0.0 - 1.2.0) use the older proxy creation code
+  legacy:
+    '0x608060405234801561001057600080fd5b506040516020806101a88339810180604052602081101561003057600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100c7576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260248152602001806101846024913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555050606e806101166000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054163660008037600080366000845af43d6000803e6000811415603d573d6000fd5b3d6000f3fea165627a7a723058201e7d648b83cfac072cbccefc2ffc62a6999d4a050ee87a721942de1da9670db80029496e76616c6964206d617374657220636f707920616464726573732070726f7669646564',
+  // Newer versions (1.3.0+) use the updated proxy creation code
+  latest:
+    '0x608060405234801561001057600080fd5b506040516101e63803806101e68339818101604052602081101561003357600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100ca576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260228152602001806101c46022913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505060ab806101196000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054167fa619486e0000000000000000000000000000000000000000000000000000000060003514156050578060005260206000f35b3660008037600080366000845af43d6000803e60008114156070573d6000fd5b3d6000f3fea2646970667358221220d1429297349653a4918076d650332de1a1068c5f3e07c5c82360c277770b955264736f6c63430007060033496e76616c69642073696e676c65746f6e20616464726573732070726f7669646564'
+} as const
+
+/**
+ * Detects if a chain is zkSync.
+ *
+ * @param {bigint | number} chainId - The chain ID to check.
+ * @returns {boolean} True if the provided chain is a zkSync network; otherwise false.
+ */
+function isZkSyncChain(chainId: bigint | number): boolean {
+  const ZKSYNC_CHAIN_IDS = new Set([
+    324, // zkSync Era mainnet
+    300, // zkSync Era testnet
+    280, // zkSync Era localnet
+    232 // zkSync Era internal testnet
+  ])
+  return ZKSYNC_CHAIN_IDS.has(Number(chainId))
+}
+
+/**
+ * Returns the Safe Proxy creation bytecode for the provided Safe version on EVM chains.
+ *
+ * - Versions 1.0.0 - 1.2.0 use the legacy bytecode.
+ * - Versions 1.3.0+ use the latest bytecode.
+ * - zkSync chains are not supported by this function (different CREATE2 mechanics).
+ *
+ * @param {string} safeVersion - The Safe core version used to select the bytecode.
+ * @param {bigint | number} [chainId] - Optional chain ID; if a zkSync chain is detected, an error is thrown.
+ * @returns {`0x${string}`} The proxy creation bytecode for the given Safe version.
+ * @throws {Error} If called for a zkSync chain.
+ */
+function getProxyCreationCode(safeVersion: string, chainId?: bigint | number): `0x${string}` {
+  if (chainId && isZkSyncChain(chainId)) {
+    // TODO: implement zkSync
+    throw new Error(
+      `zkSync chains (${chainId}) use different CREATE2 mechanics. Use predictSafeAddressWithChainId for zkSync support.`
+    )
+  }
+
+  const version = safeVersion.split('.')
+  const major = parseInt(version[0])
+  const minor = parseInt(version[1])
+
+  if (major === 1 && minor <= 2) {
+    return SAFE_PROXY_CREATION_CODES.legacy
+  } else {
+    return SAFE_PROXY_CREATION_CODES.latest
+  }
+}
+
+// Constants for Safe deployment
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const EMPTY_DATA = '0x'
 
 const MAX_ERC20_AMOUNT_TO_APPROVE =
   0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn
 
 const EQ_OR_GT_1_4_1 = '>=1.4.1'
+
+/**
+ * Encodes the Safe setup initializer data synchronously.
+ *
+ * Produces the exact calldata used by Safe deployment, matching version-specific ABIs:
+ * - Safe 1.0.0: setup(address[] _owners, uint256 _threshold, address to, bytes data, address paymentToken, uint256 payment, address paymentReceiver)
+ * - Safe 1.1.0+: setup(address[] _owners, uint256 _threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)
+ *
+ * @param {SafeAccountConfig} safeAccountConfig - The configuration used for the Safe setup transaction.
+ * @param {string} safeVersion - The Safe core version used to select the correct ABI.
+ * @returns {string} Hex-encoded calldata for the Safe setup function.
+ */
+function encodeSetupCallDataSync(
+  safeAccountConfig: SafeAccountConfig,
+  safeVersion: string
+): string {
+  const {
+    owners,
+    threshold,
+    to = ZERO_ADDRESS,
+    data = EMPTY_DATA,
+    fallbackHandler = ZERO_ADDRESS,
+    paymentToken = ZERO_ADDRESS,
+    payment = 0,
+    paymentReceiver = ZERO_ADDRESS
+  } = safeAccountConfig
+
+  const version = safeVersion.split('.')
+  const major = parseInt(version[0])
+  const minor = parseInt(version[1])
+
+  if (major === 1 && minor === 0) {
+    // Safe 1.0.0 and below: 7 parameters (no fallbackHandler)
+    const setupData = encodeFunctionData({
+      abi: [
+        {
+          inputs: [
+            { name: '_owners', type: 'address[]' },
+            { name: '_threshold', type: 'uint256' },
+            { name: 'to', type: 'address' },
+            { name: 'data', type: 'bytes' },
+            { name: 'paymentToken', type: 'address' },
+            { name: 'payment', type: 'uint256' },
+            { name: 'paymentReceiver', type: 'address' }
+          ],
+          name: 'setup',
+          outputs: [],
+          stateMutability: 'nonpayable',
+          type: 'function'
+        }
+      ],
+      functionName: 'setup',
+      args: [
+        owners,
+        BigInt(threshold),
+        to as `0x${string}`,
+        data as `0x${string}`,
+        paymentToken as `0x${string}`,
+        BigInt(payment),
+        paymentReceiver as `0x${string}`
+      ]
+    })
+    return setupData
+  } else {
+    // Safe 1.1.0+: 8 parameters (with fallbackHandler)
+    const setupData = encodeFunctionData({
+      abi: [
+        {
+          inputs: [
+            { name: '_owners', type: 'address[]' },
+            { name: '_threshold', type: 'uint256' },
+            { name: 'to', type: 'address' },
+            { name: 'data', type: 'bytes' },
+            { name: 'fallbackHandler', type: 'address' },
+            { name: 'paymentToken', type: 'address' },
+            { name: 'payment', type: 'uint256' },
+            { name: 'paymentReceiver', type: 'address' }
+          ],
+          name: 'setup',
+          outputs: [],
+          stateMutability: 'nonpayable',
+          type: 'function'
+        }
+      ],
+      functionName: 'setup',
+      args: [
+        owners,
+        BigInt(threshold),
+        to as `0x${string}`,
+        data as `0x${string}`,
+        fallbackHandler as `0x${string}`,
+        paymentToken as `0x${string}`,
+        BigInt(payment),
+        paymentReceiver as `0x${string}`
+      ]
+    })
+    return setupData
+  }
+}
 
 /**
  * Safe4337Pack class that extends RelayKitBasePack.
@@ -715,5 +936,112 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
   getOnchainIdentifier(): string {
     return this.#onchainIdentifier
+  }
+
+  /**
+   * Predicts the address of a Safe account and returns it.
+   *
+   * Implements the CREATE2 derivation using the Safe Proxy Factory:
+   * address = keccak256(0xff ++ factoryAddress ++ salt ++ keccak256(initCode))[12:]
+   *
+   * @param {Object} config - The prediction configuration.
+   * @param {string} config.factoryAddress - The Safe ProxyFactory contract address.
+   * @param {string} config.singletonAddress - The Safe singleton contract address.
+   * @param {SafeAccountConfig} config.safeAccountConfig - The Safe account configuration used to encode the initializer.
+   * @param {string} config.saltNonce - 0x-prefixed 32-byte salt used for CREATE2.
+   * @param {string} config.safeVersion - The Safe core version to use for ABI and proxy code selection.
+   * @param {bigint | number} [config.chainId] - Optional chain ID; used to guard against zkSync usage in this path.
+   * @returns {string} The predicted Safe address (checksumed hex string).
+   */
+  static predictSafeAddress({
+    factoryAddress,
+    singletonAddress,
+    safeAccountConfig,
+    saltNonce,
+    safeVersion,
+    chainId
+  }: {
+    factoryAddress: string
+    singletonAddress: string
+    safeAccountConfig: SafeAccountConfig
+    saltNonce: string
+    safeVersion: string
+    chainId?: bigint | number
+  }): string {
+    // 1. Encode initializer from SafeAccountConfig
+    const initializer = encodeSetupCallDataSync(safeAccountConfig, safeVersion)
+
+    // 2. Salt
+    const initializerHash = keccak256(initializer as `0x${string}`)
+    const salt = keccak256(concat([initializerHash, saltNonce as `0x${string}`]))
+
+    // 3. Build initCode = proxyCreationCode ++ constructor(singleton)
+    const proxyCreationCode = getProxyCreationCode(safeVersion, chainId)
+    const singletonEncoded = toHex(singletonAddress, { size: 32 })
+    const initCode = concat([proxyCreationCode as `0x${string}`, singletonEncoded])
+
+    // 4. CREATE2 formula
+    const hash = keccak256(
+      concat(['0xff' as `0x${string}`, factoryAddress as `0x${string}`, salt, keccak256(initCode)])
+    )
+
+    return slice(hash, 12)
+  }
+
+  /**
+   * Predicts the address of a Safe account using deployment data resolved by chain ID and Safe version.
+   *
+   * This convenience method fetches the canonical ProxyFactory and singleton addresses
+   * from @safe-global/safe-deployments and delegates to predictSafeAddress.
+   *
+   * @param {Object} config - The prediction configuration.
+   * @param {bigint | number} config.chainId - The chain ID.
+   * @param {SafeAccountConfig} config.safeAccountConfig - The Safe account configuration used to encode the initializer.
+   * @param {string} config.saltNonce - 0x-prefixed 32-byte salt used for CREATE2.
+   * @param {string} config.safeVersion - The Safe core version to use for ABI and proxy code selection.
+   * @returns {string} The predicted Safe address (checksumed hex string).
+   * @throws {Error} If called for a zkSync chain. Use the zkSync-specific path for prediction.
+   */
+  static predictSafeAddressWithChainId({
+    chainId,
+    safeAccountConfig,
+    saltNonce,
+    safeVersion
+  }: {
+    chainId: bigint | number
+    safeAccountConfig: SafeAccountConfig
+    saltNonce: string
+    safeVersion: string
+  }): string {
+    // zkSync guard – we will implement zkSync preimage in a separate step
+    if (isZkSyncChain(chainId)) {
+      throw new Error(
+        'zkSync address prediction requires zkSync CREATE2 preimage. Use zkSync-specific path.'
+      )
+    }
+
+    const addresses = getSafeContractAddresses(chainId, safeVersion)
+
+    return Safe4337Pack.predictSafeAddress({
+      factoryAddress: addresses.factory,
+      singletonAddress: addresses.singleton,
+      safeAccountConfig,
+      saltNonce,
+      safeVersion,
+      chainId
+    })
+  }
+
+  /**
+   * Gets the default factory and singleton addresses for a given chain ID.
+   *
+   * This helper uses the default Safe version supported by the library (currently '1.4.1').
+   *
+   * @param {bigint | number} chainId - The chain ID.
+   * @returns {{ factory: string; singleton: string }} Object containing factory and singleton addresses.
+   * @throws {Error} If no default addresses are found for the chain ID.
+   */
+  static getDefaultAddresses(chainId: bigint | number): { factory: string; singleton: string } {
+    return getSafeContractAddresses(chainId)
   }
 }
