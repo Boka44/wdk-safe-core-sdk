@@ -209,7 +209,6 @@ function encodeSetupCallDataSync(
   const minor = parseInt(version[1])
 
   if (major === 1 && minor === 0) {
-    // Safe 1.0.0 and below: 7 parameters (no fallbackHandler)
     const setupData = encodeFunctionData({
       abi: [
         {
@@ -241,7 +240,6 @@ function encodeSetupCallDataSync(
     })
     return setupData
   } else {
-    // Safe 1.1.0+: 8 parameters (with fallbackHandler)
     const setupData = encodeFunctionData({
       abi: [
         {
